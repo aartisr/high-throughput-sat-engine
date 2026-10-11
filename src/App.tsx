@@ -4,7 +4,7 @@
  */
 
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { CameraMode, ConjunctionEvent, ConjunctionRiskLevel, ManeuverPlan, OrbitalObject, PipelineMetrics } from './astrodynamics/types.ts';
+import { CameraMode, ConjunctionEvent, ConjunctionRiskLevel, ManeuverPlan, OrbitalObject, PipelineMetrics, WhatIfDeltaV } from './astrodynamics/types.ts';
 import { globalStreamEngine, BackpressureMode } from './pipeline/streamEngine.ts';
 import { TopTelemetryRibbon } from './components/TopTelemetryRibbon.tsx';
 import { LeftPipelinePanel } from './components/LeftPipelinePanel.tsx';
@@ -32,6 +32,15 @@ export default function App() {
   const [currentTimeMs, setCurrentTimeMs] = useState<number>(Date.now());
   const [timeWarp, setTimeWarp] = useState<number>(1);
   const [cameraMode, setCameraMode] = useState<CameraMode>('ECI');
+
+  // Predictive What-If Trajectory Delta-V State (synced across CARA Panel & 3D Globe)
+  const [whatIfDeltaV, setWhatIfDeltaV] = useState<WhatIfDeltaV>({
+    alongTrackMs: 1.45,
+    radialMs: 0.0,
+    crossTrackMs: 0.0,
+    thrusterType: 'MONOPROPELLANT_HYDRAZINE',
+    isActive: true
+  });
 
   const [isIngestModalOpen, setIsIngestModalOpen] = useState<boolean>(false);
   const [eventsLog, setEventsLog] = useState<Array<{ id: string; time: string; text: string; type: 'info' | 'alert' | 'success' }>>([
@@ -208,6 +217,8 @@ export default function App() {
             onTimeWarpChange={setTimeWarp}
             cameraMode={cameraMode}
             onCameraModeChange={setCameraMode}
+            whatIfDeltaV={whatIfDeltaV}
+            onWhatIfDeltaVChange={setWhatIfDeltaV}
           />
         </main>
 
@@ -217,6 +228,8 @@ export default function App() {
           selectedConjunction={selectedConjunction}
           onSelectConjunction={handleSelectConjunction}
           onExecuteManeuver={handleExecuteManeuver}
+          whatIfDeltaV={whatIfDeltaV}
+          onWhatIfDeltaVChange={setWhatIfDeltaV}
         />
       </div>
 

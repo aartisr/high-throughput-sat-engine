@@ -8,14 +8,15 @@
 
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import * as THREE from 'three';
-import { CameraMode, ConjunctionEvent, OrbitalObject } from '../../astrodynamics/types.ts';
+import { CameraMode, ConjunctionEvent, OrbitalObject, WhatIfDeltaV } from '../../astrodynamics/types.ts';
 import { generateOrbitPathEci, propagateOrbit } from '../../astrodynamics/propagator.ts';
 import { getGmstRad, getJulianDate } from '../../astrodynamics/coordinates.ts';
 import { GROUND_STATIONS_CATALOG, GroundStation, checkStationLineOfSight, DownlinkPassState } from '../../astrodynamics/groundStations.ts';
 import { calculateSunPositionEci, calculateSatelliteEclipse, SatelliteEclipseResult } from '../../astrodynamics/solarCalculator.ts';
+import { computeWhatIfManeuver } from '../../astrodynamics/maneuverPlanner.ts';
 import { createEarthCanvasTexture } from './earthTexture.ts';
 import { createRadarSweepTexture } from './radarSweepTexture.ts';
-import { RotateCcw, Compass, Radio, Antenna, Scan, Sun, Moon } from 'lucide-react';
+import { RotateCcw, Compass, Radio, Antenna, Scan, Sun, Moon, Zap } from 'lucide-react';
 
 interface TacticalGlobeProps {
   objects: OrbitalObject[];
@@ -27,6 +28,8 @@ interface TacticalGlobeProps {
   onTimeWarpChange: (warp: number) => void;
   cameraMode: CameraMode;
   onCameraModeChange: (mode: CameraMode) => void;
+  whatIfDeltaV?: WhatIfDeltaV;
+  onWhatIfDeltaVChange?: (deltaV: WhatIfDeltaV) => void;
 }
 
 // 1 Three.js unit = 1,000 km
@@ -54,7 +57,9 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
   timeWarp,
   onTimeWarpChange,
   cameraMode,
-  onCameraModeChange
+  onCameraModeChange,
+  whatIfDeltaV,
+  onWhatIfDeltaVChange
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -66,6 +71,7 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
   const [showGroundStations, setShowGroundStations] = useState<boolean>(true);
   const [showRadarSweep, setShowRadarSweep] = useState<boolean>(true);
   const [showSunLighting, setShowSunLighting] = useState<boolean>(true);
+  const [showWhatIf, setShowWhatIf] = useState<boolean>(true);
 
   // Active Downlink Pass State
   const [activeDownlink, setActiveDownlink] = useState<DownlinkPassState | null>(null);
@@ -73,6 +79,30 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
   const [sweepAzimuthDeg, setSweepAzimuthDeg] = useState<number>(0);
   // Selected satellite eclipse state
   const [satelliteEclipse, setSatelliteEclipse] = useState<SatelliteEclipseResult | null>(null);
+
+  // Whether What-If mode is currently active with non-zero delta-V
+  const isWhatIfActive = Boolean(
+    whatIfDeltaV &&
+    whatIfDeltaV.isActive &&
+    (Math.abs(whatIfDeltaV.alongTrackMs) > 0.001 || Math.abs(whatIfDeltaV.radialMs) > 0.001 || Math.abs(whatIfDeltaV.crossTrackMs) > 0.001)
+  );
+
+  const targetAsset = selectedConjunction?.primaryObject || selectedObject;
+
+  // Compute live What-If predictive maneuver impact
+  const whatIfResult = useMemo(() => {
+    if (!targetAsset || !whatIfDeltaV || !isWhatIfActive) return null;
+    return computeWhatIfManeuver(
+      targetAsset,
+      {
+        alongTrackMs: whatIfDeltaV.alongTrackMs,
+        radialMs: whatIfDeltaV.radialMs,
+        crossTrackMs: whatIfDeltaV.crossTrackMs
+      },
+      selectedConjunction,
+      whatIfDeltaV.thrusterType
+    );
+  }, [targetAsset, whatIfDeltaV, isWhatIfActive, selectedConjunction]);
 
   // Three.js instances ref
   const sceneRef = useRef<{
@@ -86,6 +116,7 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
     sunLight: THREE.DirectionalLight;
     sunMarkerGroup: THREE.Group;
     orbitLinesGroup: THREE.Group;
+    whatIfGroup: THREE.Group;
     debrisPointCloud: THREE.Points | null;
     activePointCloud: THREE.Points | null;
     covarianceGroup: THREE.Group;
@@ -179,6 +210,10 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
     // Orbit lines group
     const orbitLinesGroup = new THREE.Group();
     scene.add(orbitLinesGroup);
+
+    // What-If predictive maneuver orbit group
+    const whatIfGroup = new THREE.Group();
+    scene.add(whatIfGroup);
 
     // Covariance encounter group
     const covarianceGroup = new THREE.Group();
@@ -314,6 +349,7 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
       sunLight,
       sunMarkerGroup,
       orbitLinesGroup,
+      whatIfGroup,
       debrisPointCloud: null,
       activePointCloud: null,
       covarianceGroup,
@@ -457,13 +493,14 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
     }
   }, [objects, showDebrisCloud]);
 
-  // Visibility toggle for Ground Stations, Radar Sweep, & Sun Lighting
+  // Visibility toggle for Ground Stations, Radar Sweep, Sun Lighting, & What-If Trajectory
   useEffect(() => {
     if (!sceneRef.current) return;
     sceneRef.current.groundStationsGroup.visible = showGroundStations;
     sceneRef.current.downlinkLinesGroup.visible = showGroundStations;
     sceneRef.current.radarGroup.visible = showRadarSweep;
     sceneRef.current.sunMarkerGroup.visible = showSunLighting;
+    sceneRef.current.whatIfGroup.visible = showWhatIf;
 
     if (showSunLighting) {
       sceneRef.current.ambientLight.intensity = 0.16;
@@ -472,12 +509,12 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
       sceneRef.current.ambientLight.intensity = 0.65;
       sceneRef.current.sunLight.intensity = 1.2;
     }
-  }, [showGroundStations, showRadarSweep, showSunLighting]);
+  }, [showGroundStations, showRadarSweep, showSunLighting, showWhatIf]);
 
   // Update Orbit Trajectories & Encounter Ellipsoids with Eclipse Shading
   useEffect(() => {
     if (!sceneRef.current) return;
-    const { orbitLinesGroup, covarianceGroup } = sceneRef.current;
+    const { orbitLinesGroup, covarianceGroup, whatIfGroup } = sceneRef.current;
 
     while (orbitLinesGroup.children.length > 0) {
       const child = orbitLinesGroup.children[0] as THREE.Object3D;
@@ -489,6 +526,12 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
       const child = covarianceGroup.children[0] as THREE.Mesh;
       covarianceGroup.remove(child);
       if (child.geometry) child.geometry.dispose();
+    }
+
+    while (whatIfGroup.children.length > 0) {
+      const child = whatIfGroup.children[0] as THREE.Object3D;
+      whatIfGroup.remove(child);
+      if ((child as any).geometry) (child as any).geometry.dispose();
     }
 
     if (!showOrbits) return;
@@ -632,7 +675,108 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
         covarianceGroup.add(missLine);
       }
     }
-  }, [selectedObject, selectedConjunction, showOrbits, showCovariance, showSunLighting, currentTimeMs]);
+
+    // 4. Render 'What-If' Predictive Post-Maneuver Orbit Trajectory
+    if (showWhatIf && isWhatIfActive && whatIfResult && targetAsset) {
+      const samples = 120;
+      const periodSec = whatIfResult.revisedKeplerian.periodMinutes * 60.0;
+      const dt = periodSec / samples;
+
+      const positions: number[] = [];
+      const colors: number[] = [];
+      const colorGold = new THREE.Color(0xfbbf24);   // Amber-400
+      const colorBright = new THREE.Color(0xfef08a); // Yellow-200
+
+      for (let i = 0; i < samples; i++) {
+        const t1 = currentTimeMs + i * dt * 1000.0;
+        const t2 = currentTimeMs + (i + 1) * dt * 1000.0;
+
+        const s1 = propagateOrbit(whatIfResult.revisedKeplerian, t1);
+        const s2 = propagateOrbit(whatIfResult.revisedKeplerian, t2);
+
+        positions.push(
+          s1.positionEci[0] / 1000.0, s1.positionEci[2] / 1000.0, -s1.positionEci[1] / 1000.0,
+          s2.positionEci[0] / 1000.0, s2.positionEci[2] / 1000.0, -s2.positionEci[1] / 1000.0
+        );
+
+        // Alternating segments for tactical dashed look
+        const c = i % 2 === 0 ? colorGold : colorBright;
+        colors.push(c.r, c.g, c.b, c.r, c.g, c.b);
+      }
+
+      const whatIfGeo = new THREE.BufferGeometry();
+      whatIfGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      whatIfGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+      const whatIfMat = new THREE.LineSegments(whatIfGeo, new THREE.LineBasicMaterial({
+        vertexColors: true,
+        linewidth: 3,
+        transparent: true,
+        opacity: 0.95
+      }));
+      whatIfGroup.add(whatIfMat);
+
+      // Burn impulse point marker
+      const burnState = propagateOrbit(targetAsset.keplerian, whatIfResult.burnEpochMs);
+      const burnPos = new THREE.Vector3(
+        burnState.positionEci[0] / 1000.0,
+        burnState.positionEci[2] / 1000.0,
+        -burnState.positionEci[1] / 1000.0
+      );
+
+      const burnMarkerGeo = new THREE.SphereGeometry(0.24, 16, 16);
+      const burnMarkerMat = new THREE.MeshBasicMaterial({
+        color: 0xf59e0b,
+        wireframe: true
+      });
+      const burnMarkerMesh = new THREE.Mesh(burnMarkerGeo, burnMarkerMat);
+      burnMarkerMesh.position.copy(burnPos);
+      whatIfGroup.add(burnMarkerMesh);
+
+      const coreMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.12, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      coreMesh.position.copy(burnPos);
+      whatIfGroup.add(coreMesh);
+
+      // If in a conjunction, show post-maneuver cleared position at TCA
+      if (selectedConjunction) {
+        const sTcaState = propagateOrbit(selectedConjunction.secondaryObject.keplerian, selectedConjunction.tcaTimestampMs);
+        const pNewTcaState = propagateOrbit(whatIfResult.revisedKeplerian, selectedConjunction.tcaTimestampMs);
+
+        const sPos = new THREE.Vector3(
+          sTcaState.positionEci[0] / 1000.0,
+          sTcaState.positionEci[2] / 1000.0,
+          -sTcaState.positionEci[1] / 1000.0
+        );
+        const pNewPos = new THREE.Vector3(
+          pNewTcaState.positionEci[0] / 1000.0,
+          pNewTcaState.positionEci[2] / 1000.0,
+          -pNewTcaState.positionEci[1] / 1000.0
+        );
+
+        // Cleared green marker
+        const pNewMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.18, 12, 12),
+          new THREE.MeshBasicMaterial({ color: 0x10b981 })
+        );
+        pNewMesh.position.copy(pNewPos);
+        whatIfGroup.add(pNewMesh);
+
+        // Green dashed clearance miss distance vector
+        const clearedLineGeo = new THREE.BufferGeometry().setFromPoints([pNewPos, sPos]);
+        const clearedLineMat = new THREE.LineDashedMaterial({
+          color: 0x10b981,
+          dashSize: 0.3,
+          gapSize: 0.15
+        });
+        const clearedLine = new THREE.Line(clearedLineGeo, clearedLineMat);
+        clearedLine.computeLineDistances();
+        whatIfGroup.add(clearedLine);
+      }
+    }
+  }, [selectedObject, selectedConjunction, showOrbits, showCovariance, showSunLighting, showWhatIf, isWhatIfActive, whatIfResult, targetAsset, currentTimeMs]);
 
   // Main Render Animation Loop
   useEffect(() => {
@@ -849,6 +993,21 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
             <span className="text-emerald-400 font-bold">{activeDownlink.dataRateMbps} Mbps</span>
           </div>
         )}
+
+        {/* Predictive What-If Post-Maneuver Trajectory Banner */}
+        {showWhatIf && isWhatIfActive && whatIfResult && (
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-950/90 backdrop-blur-md border border-amber-500/80 rounded-md text-xs font-mono text-amber-200 shadow-[0_0_12px_rgba(245,158,11,0.35)]">
+            <Zap className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+            <span className="font-bold">WHAT-IF TRAJECTORY:</span>
+            <span className="text-white font-semibold">|ΔV| {whatIfResult.deltaV.totalMs.toFixed(2)} m/s</span>
+            <span className="text-amber-500">·</span>
+            <span>POST MISS: <strong className="text-emerald-400 font-bold">{whatIfResult.predictedMissDistanceKm.toFixed(2)} km</strong></span>
+            <span className="text-amber-500">·</span>
+            <span>Pc: <strong className="text-cyan-300">{whatIfResult.predictedPc.toExponential(1)}</strong></span>
+            <span className="text-amber-500">·</span>
+            <span>PROP: <strong className="text-amber-300">{whatIfResult.propellantMassKg.toFixed(2)} kg</strong></span>
+          </div>
+        )}
       </div>
 
       {/* Top Right HUD: Viewport Layer Controls */}
@@ -926,6 +1085,21 @@ export const TacticalGlobe: React.FC<TacticalGlobeProps> = ({
           title="Toggle 3D Covariance Ellipsoids"
         >
           COVARIANCE
+        </button>
+
+        <button
+          onClick={() => setShowWhatIf(!showWhatIf)}
+          className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors flex items-center gap-1 ${
+            showWhatIf && isWhatIfActive
+              ? 'bg-amber-950/80 border-amber-400 text-amber-300 shadow-[0_0_8px_rgba(245,158,11,0.3)]'
+              : showWhatIf
+              ? 'bg-amber-950/80 border-amber-500/60 text-amber-300'
+              : 'bg-slate-900/80 border-slate-700 text-slate-400'
+          }`}
+          title="Toggle Predictive What-If Maneuver Trajectory on Tactical Globe"
+        >
+          <Zap className="w-3 h-3 text-amber-400" />
+          <span>WHAT-IF</span>
         </button>
 
         <button

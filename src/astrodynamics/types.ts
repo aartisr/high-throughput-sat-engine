@@ -114,3 +114,31 @@ export interface PipelineMetrics {
   backpressureActive: boolean;
   cpuLoadPercent: number;
 }
+
+export interface WhatIfDeltaV {
+  alongTrackMs: number;  // Delta-V Along-track / Transverse (m/s) (+ prograde, - retrograde)
+  radialMs: number;      // Delta-V Radial (m/s) (+ radial out, - radial in)
+  crossTrackMs: number;  // Delta-V Cross-track / Normal (m/s) (+ north, - south)
+  thrusterType: 'MONOPROPELLANT_HYDRAZINE' | 'HALL_EFFECT_ION';
+  isActive: boolean;
+}
+
+export interface WhatIfManeuverResult {
+  deltaV: {
+    alongTrackMs: number;
+    radialMs: number;
+    crossTrackMs: number;
+    totalMs: number;
+  };
+  thrusterType: 'MONOPROPELLANT_HYDRAZINE' | 'HALL_EFFECT_ION';
+  propellantMassKg: number;
+  burnDurationSeconds: number;
+  revisedKeplerian: KeplerianElements;
+  predictedMissDistanceKm: number;
+  predictedPc: number;
+  deltaApogeeKm: number;
+  deltaPerigeeKm: number;
+  deltaPeriodSeconds: number;
+  burnEpochMs: number;
+}
+
