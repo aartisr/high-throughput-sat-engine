@@ -34,9 +34,28 @@ import {
   SlidersHorizontal,
   LayoutGrid
 } from 'lucide-react';
-import { GROUND_STATIONS_CATALOG, checkStationLineOfSight } from '../astrodynamics/groundStations.ts';
+import {
+  GROUND_STATIONS_CATALOG,
+  checkStationLineOfSight,
+  CarrierBand,
+  getBestTrackingStationDoppler
+} from '../astrodynamics/groundStations.ts';
 import { getGmstRad, getJulianDate } from '../astrodynamics/coordinates.ts';
+import { propagateOrbit } from '../astrodynamics/propagator.ts';
 import { SubsystemHeatmapWidget } from './SubsystemHeatmapWidget.tsx';
+
+export interface DopplerPoint {
+  second: number;
+  timeLabel: string;
+  dopplerShiftKhz: number;
+  rangeRateKmS: number;
+  dopplerRateHzS: number;
+  elevationDeg: number;
+  rangeKm: number;
+  stationCallsign: string;
+  stationName: string;
+  inView: boolean;
+}
 
 interface BottomTelemetryTrayProps {
   metrics: PipelineMetrics;
@@ -80,8 +99,9 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
 }) => {
   const [isExpanded, setIsExpanded] = useState<boolean>(true);
   const [throughputHistory, setThroughputHistory] = useState<number[]>([]);
-  // Toggle between O-C Residuals and SNR view in the first card
-  const [telemetryCardMode, setTelemetryCardMode] = useState<'RESIDUALS' | 'SNR'>('RESIDUALS');
+  // Toggle between Doppler shift, O-C Residuals, and SNR view in the first card
+  const [telemetryCardMode, setTelemetryCardMode] = useState<'DOPPLER' | 'RESIDUALS' | 'SNR'>('DOPPLER');
+  const [carrierBand, setCarrierBand] = useState<CarrierBand>('S_BAND');
   // Overall tray view mode: 'METRICS' (4 cards) or 'HEATMAP' (full matrix)
   const [trayViewMode, setTrayViewMode] = useState<'METRICS' | 'HEATMAP'>('METRICS');
   // Toggle between Heatmap and Waterfall in the 3rd card
@@ -136,6 +156,53 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
         crossTrackM: crossTrack,
         rmsM: rms,
         gateM: 250
+      });
+    }
+    return initial;
+  });
+
+  // 30-second rolling history for Doppler Frequency Shift (kHz) & Range Rate (km/s)
+  const [dopplerHistory, setDopplerHistory] = useState<DopplerPoint[]>(() => {
+    const initial: DopplerPoint[] = [];
+    let prevShift = 0;
+    for (let i = 29; i >= 0; i--) {
+      const t = currentTimeMs - i * 1000;
+      let shift = 0;
+      let rangeRate = 0;
+      let elev = 22.4;
+      let range = 640;
+      let callsign = 'POGO';
+      let name = 'Thule TTS';
+      let inView = true;
+
+      if (selectedObject) {
+        const state = propagateOrbit(selectedObject.keplerian, t);
+        const jdT = getJulianDate(t);
+        const gmstT = getGmstRad(jdT);
+        const obs = getBestTrackingStationDoppler(state.positionEci, state.velocityEci, gmstT, 'S_BAND');
+        shift = obs.dopplerShiftKhz;
+        rangeRate = obs.rangeRateKmS;
+        elev = obs.elevationDeg;
+        range = obs.rangeKm;
+        callsign = obs.station.callsign;
+        name = obs.station.name;
+        inView = obs.inView;
+      }
+
+      const driftHzS = i === 29 ? 0 : Math.round((shift - prevShift) * 1000);
+      prevShift = shift;
+
+      initial.push({
+        second: t,
+        timeLabel: i === 0 ? 'now' : `-${i}s`,
+        dopplerShiftKhz: parseFloat(shift.toFixed(2)),
+        rangeRateKmS: parseFloat(rangeRate.toFixed(3)),
+        dopplerRateHzS: driftHzS,
+        elevationDeg: parseFloat(elev.toFixed(1)),
+        rangeKm: Math.round(range),
+        stationCallsign: callsign,
+        stationName: name,
+        inView
       });
     }
     return initial;
@@ -256,6 +323,137 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
     return () => clearInterval(interval);
   }, [selectedObject]);
 
+  // Update Doppler Shift time-series for selected satellite every 1 second
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDopplerHistory(prev => {
+        let shift = 0;
+        let rangeRate = 0;
+        let elev = 0;
+        let range = 1000;
+        let callsign = 'POGO';
+        let name = 'Thule TTS';
+        let inView = false;
+
+        if (selectedObject) {
+          const state = propagateOrbit(selectedObject.keplerian, currentTimeMs);
+          const jd = getJulianDate(currentTimeMs);
+          const gmst = getGmstRad(jd);
+          const obs = getBestTrackingStationDoppler(state.positionEci, state.velocityEci, gmst, carrierBand);
+          shift = obs.dopplerShiftKhz;
+          rangeRate = obs.rangeRateKmS;
+          elev = obs.elevationDeg;
+          range = obs.rangeKm;
+          callsign = obs.station.callsign;
+          name = obs.station.name;
+          inView = obs.inView;
+        }
+
+        const lastPoint = prev[prev.length - 1];
+        const driftHzS = lastPoint
+          ? Math.round((shift - lastPoint.dopplerShiftKhz) * 1000)
+          : 0;
+
+        const newPoint: DopplerPoint = {
+          second: currentTimeMs,
+          timeLabel: 'now',
+          dopplerShiftKhz: parseFloat(shift.toFixed(2)),
+          rangeRateKmS: parseFloat(rangeRate.toFixed(3)),
+          dopplerRateHzS: driftHzS,
+          elevationDeg: parseFloat(elev.toFixed(1)),
+          rangeKm: Math.round(range),
+          stationCallsign: callsign,
+          stationName: name,
+          inView
+        };
+
+        const next = [...prev.slice(1), newPoint];
+        return next.map((pt, idx) => ({
+          ...pt,
+          timeLabel: idx === 29 ? 'now' : `-${29 - idx}s`
+        }));
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [selectedObject, currentTimeMs, carrierBand]);
+
+  // Recalculate Doppler history immediately on satellite selection or carrier band change
+  useEffect(() => {
+    if (!selectedObject) return;
+    const recalculated: DopplerPoint[] = [];
+    let prevShift = 0;
+    for (let i = 29; i >= 0; i--) {
+      const t = currentTimeMs - i * 1000;
+      const state = propagateOrbit(selectedObject.keplerian, t);
+      const jdT = getJulianDate(t);
+      const gmstT = getGmstRad(jdT);
+      const obs = getBestTrackingStationDoppler(state.positionEci, state.velocityEci, gmstT, carrierBand);
+      const driftHzS = i === 29 ? 0 : Math.round((obs.dopplerShiftKhz - prevShift) * 1000);
+      prevShift = obs.dopplerShiftKhz;
+
+      recalculated.push({
+        second: t,
+        timeLabel: i === 0 ? 'now' : `-${i}s`,
+        dopplerShiftKhz: parseFloat(obs.dopplerShiftKhz.toFixed(2)),
+        rangeRateKmS: parseFloat(obs.rangeRateKmS.toFixed(3)),
+        dopplerRateHzS: driftHzS,
+        elevationDeg: parseFloat(obs.elevationDeg.toFixed(1)),
+        rangeKm: Math.round(obs.rangeKm),
+        stationCallsign: obs.station.callsign,
+        stationName: obs.station.name,
+        inView: obs.inView
+      });
+    }
+    setDopplerHistory(recalculated);
+  }, [selectedObject?.id, carrierBand]);
+
+  // Compute stats for Doppler frequency shift & range-rate
+  const {
+    currentDoppler,
+    currentRangeRate,
+    currentDopplerRate,
+    currentStationCallsign,
+    currentStationName,
+    isDopplerInView,
+    dopplerDomain,
+    dopplerStatus
+  } = useMemo(() => {
+    if (dopplerHistory.length === 0) {
+      return {
+        currentDoppler: 0,
+        currentRangeRate: 0,
+        currentDopplerRate: 0,
+        currentStationCallsign: 'TTS',
+        currentStationName: 'Thule TTS',
+        isDopplerInView: false,
+        dopplerDomain: [-50, 50] as [number, number],
+        dopplerStatus: 'AWAITING TELEMETRY'
+      };
+    }
+    const curr = dopplerHistory[dopplerHistory.length - 1];
+    const allAbs = dopplerHistory.map(d => Math.abs(d.dopplerShiftKhz));
+    const maxVal = Math.max(15, Math.ceil(Math.max(...allAbs) * 1.25));
+
+    let status = 'APPROACHING (AOS)';
+    if (Math.abs(curr.dopplerShiftKhz) < 2.0 && Math.abs(curr.rangeRateKmS) < 0.4) {
+      status = 'TCA ZENITH (INFLECTION)';
+    } else if (curr.rangeRateKmS > 0) {
+      status = 'RECEDING (LOS)';
+    }
+
+    return {
+      currentDoppler: curr.dopplerShiftKhz,
+      currentRangeRate: curr.rangeRateKmS,
+      currentDopplerRate: curr.dopplerRateHzS,
+      currentStationCallsign: curr.stationCallsign,
+      currentStationName: curr.stationName,
+      isDopplerInView: curr.inView,
+      dopplerDomain: [-maxVal, maxVal] as [number, number],
+      dopplerStatus: status
+    };
+  }, [dopplerHistory]);
+
   // Compute stats for O-C Residuals
   const { currentRms, currentInTrack, currentRadial, currentCrossTrack, odStatus } = useMemo(() => {
     if (residualsHistory.length === 0) {
@@ -333,6 +531,10 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
           <span className="text-slate-400">
             Downlink SNR: <span className={`font-bold tabular-nums ${currentSnr >= 15 ? 'text-emerald-400' : currentSnr >= 10 ? 'text-amber-400' : 'text-rose-400'}`}>{currentSnr} dB</span>
           </span>
+          <span className="text-slate-600">·</span>
+          <span className="text-slate-400">
+            Doppler Shift: <span className="text-amber-300 font-bold tabular-nums">{currentDoppler >= 0 ? '+' : ''}{currentDoppler.toFixed(1)} kHz</span>
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
@@ -393,34 +595,62 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 p-3 text-xs font-mono">
-          {/* 1. Orbit Determination: O-C Residuals / Downlink SNR Selector Card */}
+          {/* 1. Orbit Determination & RF Telemetry: Doppler Frequency Shift / O-C Residuals / Downlink SNR Card */}
           <div className="p-2.5 bg-[#0F172A] border border-slate-800 rounded-lg flex flex-col justify-between">
             <div className="flex justify-between items-center text-[11px] mb-1">
-              {/* Tab Selector: O-C Residuals vs SNR */}
+              {/* Tab Selector: Doppler vs O-C Residuals vs SNR */}
               <div className="flex items-center gap-1 p-0.5 bg-[#07090E] rounded border border-slate-800">
                 <button
+                  onClick={() => setTelemetryCardMode('DOPPLER')}
+                  className={`px-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${
+                    telemetryCardMode === 'DOPPLER'
+                      ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/50'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Real-time Doppler Frequency Shift & Range Rate Monitoring"
+                >
+                  DOPPLER (kHz)
+                </button>
+                <button
                   onClick={() => setTelemetryCardMode('RESIDUALS')}
-                  className={`px-2 py-0.5 text-[10px] font-mono rounded transition-colors ${
+                  className={`px-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${
                     telemetryCardMode === 'RESIDUALS'
                       ? 'bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/50'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
+                  title="Orbit Determination O-C Residuals (Observed minus Computed)"
                 >
-                  O-C RESIDUALS (m)
+                  O-C RESID (m)
                 </button>
                 <button
                   onClick={() => setTelemetryCardMode('SNR')}
-                  className={`px-2 py-0.5 text-[10px] font-mono rounded transition-colors ${
+                  className={`px-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${
                     telemetryCardMode === 'SNR'
                       ? 'bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/50'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
+                  title="Downlink Signal-to-Noise Ratio Link Margin"
                 >
                   SNR (dB)
                 </button>
               </div>
 
-              {telemetryCardMode === 'RESIDUALS' ? (
+              {telemetryCardMode === 'DOPPLER' ? (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => setCarrierBand(prev => prev === 'S_BAND' ? 'X_BAND' : prev === 'X_BAND' ? 'KA_BAND' : 'S_BAND')}
+                    className="px-1.5 py-0.5 text-[9px] font-mono rounded bg-[#07090E] border border-slate-700 hover:border-amber-500/60 text-amber-300/90 transition-colors"
+                    title="Cycle Downlink Carrier Frequency Band (S: 2.2GHz, X: 8.45GHz, Ka: 26.5GHz)"
+                  >
+                    {carrierBand === 'S_BAND' ? 'S: 2.2G' : carrierBand === 'X_BAND' ? 'X: 8.4G' : 'Ka: 26G'}
+                  </button>
+                  <span className={`font-bold tabular-nums ${
+                    Math.abs(currentDoppler) < 3 ? 'text-amber-400' : currentDoppler > 0 ? 'text-cyan-400' : 'text-purple-400'
+                  }`}>
+                    {currentDoppler >= 0 ? '+' : ''}{currentDoppler.toFixed(1)} <span className="text-[10px] text-slate-400">kHz</span>
+                  </span>
+                </div>
+              ) : telemetryCardMode === 'RESIDUALS' ? (
                 <span className="text-cyan-400 font-bold tabular-nums">
                   RMS: {currentRms} <span className="text-[10px] text-slate-400">m</span>
                 </span>
@@ -431,10 +661,89 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
               )}
             </div>
 
-            {/* Canvas Area: O-C Residuals or SNR */}
+            {/* Canvas Area: Doppler, O-C Residuals, or SNR */}
             <div className="w-full h-16 relative mt-1">
               <ResponsiveContainer width="100%" height="100%">
-                {telemetryCardMode === 'RESIDUALS' ? (
+                {telemetryCardMode === 'DOPPLER' ? (
+                  /* Recharts AreaChart for Real-Time Doppler Frequency Shift & Range Rate */
+                  <AreaChart
+                    data={dopplerHistory}
+                    margin={{ top: 4, right: 4, left: 4, bottom: 0 }}
+                  >
+                    <defs>
+                      <linearGradient id="dopplerGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop
+                          offset="5%"
+                          stopColor={currentDoppler >= 0 ? '#06b6d4' : '#a855f7'}
+                          stopOpacity={0.45}
+                        />
+                        <stop
+                          offset="95%"
+                          stopColor={currentDoppler >= 0 ? '#06b6d4' : '#a855f7'}
+                          stopOpacity={0.02}
+                        />
+                      </linearGradient>
+                    </defs>
+                    <XAxis dataKey="timeLabel" hide />
+                    <YAxis domain={dopplerDomain} hide />
+                    <ReferenceLine
+                      y={0}
+                      stroke="#f59e0b"
+                      strokeDasharray="2 2"
+                      strokeWidth={1}
+                    />
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (active && payload && payload.length) {
+                          const data = payload[0].payload as DopplerPoint;
+                          return (
+                            <div className="bg-[#0B0E17] border border-amber-500/60 px-2 py-1.5 rounded text-[10px] font-mono shadow-xl space-y-0.5 z-50">
+                              <div className="text-slate-400 flex justify-between items-center gap-2">
+                                <span>{data.timeLabel} · DOPPLER SHIFT</span>
+                                <span className={data.inView ? 'text-emerald-400 font-bold' : 'text-slate-500'}>
+                                  {data.inView ? 'DIRECT LOS' : 'OVER HORIZON'}
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <span className="text-slate-400">Doppler Shift (Δf):</span>
+                                <span className={`font-bold tabular-nums ${data.dopplerShiftKhz >= 0 ? 'text-cyan-300' : 'text-purple-300'}`}>
+                                  {data.dopplerShiftKhz >= 0 ? '+' : ''}{data.dopplerShiftKhz.toFixed(2)} kHz
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <span className="text-slate-400">Range Rate (dρ/dt):</span>
+                                <span className="text-white font-bold tabular-nums">
+                                  {data.rangeRateKmS >= 0 ? '+' : ''}{data.rangeRateKmS.toFixed(3)} km/s
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <span className="text-slate-400">Doppler Drift Rate:</span>
+                                <span className="text-amber-300 font-bold tabular-nums">
+                                  {data.dopplerRateHzS >= 0 ? '+' : ''}{data.dopplerRateHzS.toFixed(0)} Hz/s
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-3 text-[9px] text-slate-500 pt-0.5 border-t border-slate-800">
+                                <span>Station: <strong className="text-slate-300">{data.stationCallsign}</strong></span>
+                                <span>El: <strong className="text-slate-300">{data.elevationDeg.toFixed(1)}°</strong></span>
+                                <span>Range: <strong className="text-slate-300">{data.rangeKm} km</strong></span>
+                              </div>
+                            </div>
+                          );
+                        }
+                        return null;
+                      }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="dopplerShiftKhz"
+                      stroke={currentDoppler >= 0 ? '#06b6d4' : '#a855f7'}
+                      strokeWidth={1.5}
+                      fillOpacity={1}
+                      fill="url(#dopplerGradient)"
+                      isAnimationActive={false}
+                    />
+                  </AreaChart>
+                ) : telemetryCardMode === 'RESIDUALS' ? (
                   /* Recharts LineChart for O-C Residuals (Observed minus Computed) */
                   <LineChart
                     data={residualsHistory}
@@ -563,7 +872,22 @@ export const BottomTelemetryTray: React.FC<BottomTelemetryTrayProps> = ({
             </div>
 
             {/* Sub-bar Stats */}
-            {telemetryCardMode === 'RESIDUALS' ? (
+            {telemetryCardMode === 'DOPPLER' ? (
+              <div className="flex justify-between items-center text-[10px] text-slate-400 pt-1 border-t border-slate-800/80">
+                <span className="truncate">
+                  Range-Rate: <strong className="text-white font-bold tabular-nums">{currentRangeRate >= 0 ? '+' : ''}{currentRangeRate.toFixed(3)} km/s</strong>
+                  <span className="text-[9px] text-slate-500 ml-1">
+                    ({currentRangeRate < -0.1 ? 'Approaching' : currentRangeRate > 0.1 ? 'Receding' : 'Zenith'})
+                  </span>
+                </span>
+                <span>
+                  Drift: <strong className={Math.abs(currentDopplerRate) > 100 ? 'text-amber-400 font-bold' : 'text-slate-300'}>{currentDopplerRate >= 0 ? '+' : ''}{currentDopplerRate} Hz/s</strong>
+                </span>
+                <span className="truncate">
+                  Node: <strong className={isDopplerInView ? 'text-emerald-400 font-bold' : 'text-slate-300'}>{currentStationCallsign}</strong>
+                </span>
+              </div>
+            ) : telemetryCardMode === 'RESIDUALS' ? (
               <div className="flex justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-800/80">
                 <span className="truncate">
                   Status: <strong className="text-cyan-300">{odStatus}</strong>
