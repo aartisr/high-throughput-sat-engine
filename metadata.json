@@ -1,0 +1,6 @@
+{
+  "name": "AURA-SDA: Satellite Telemetry & Orbit Determination Engine",
+  "description": "High-throughput satellite telemetry ingestion, real-time SGP4 orbit determination, Space Domain Awareness (SDA), conjunction assessment risk analysis (CARA), and automated collision avoidance maneuver planning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
